@@ -71,7 +71,7 @@ var WidgetMetadata = {
                 },
                 {
                     name: "recentDays",
-                    title: "时间范围",
+                    title: "筛选范围",
                     type: "enumeration",
                     value: "60",
                     enumOptions: [
