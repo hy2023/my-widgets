@@ -1,13 +1,13 @@
 /* ============================================================
- * Trakt 继续观看 · CapyPlayer Widget
- * 功能：同步 Trakt 观看记录，推断下一集，生成继续观看列表
- * 依赖：Trakt API v2（公开 Client ID 仅限公开数据读取）
+ * Trakt 继续观看 · CapyPlayer Widget（免 Key 版）
+ * 内置公开只读 Client ID，用户无需注册 Trakt 应用
+ * 数据源：Trakt API v2
  * ============================================================ */
 
 var WidgetMetadata = {
-  id: "trakt_continue_watching",
-  title: "Trakt 继续观看",
-  description: "从 Trakt 同步观看进度，自动推断下一集，生成继续观看列表。",
+  id: "trakt_continue_watching_free",
+  title: "Trakt 继续观看（免 Key）",
+  description: "同步 Trakt 观看记录，自动推断下一集。无需配置 Client ID。",
   version: "1.0.0",
   author: "",
   site: "",
@@ -16,12 +16,6 @@ var WidgetMetadata = {
     {
       name: "traktUser",
       title: "Trakt 用户名",
-      type: "string",
-      defaultValue: ""
-    },
-    {
-      name: "traktClientId",
-      title: "Trakt Client ID",
       type: "string",
       defaultValue: ""
     }
@@ -77,6 +71,9 @@ var MAX_CACHE_SIZE = 300;
 var REQUEST_TIMEOUT_MS = 15000;
 var DEFAULT_HIDE_DAYS = 60;
 
+/* 公开只读 Client ID（来源：Elementum 开源项目） */
+var PUBLIC_CLIENT_ID = "eb8839a79fb2af4ebfb93f993a8a539abd4d9674a7638497bbc662d2a4b22346";
+
 /* ==================== 工具函数 ==================== */
 
 function toArray(value) {
@@ -122,7 +119,7 @@ function dedupeById(arr, keyFn) {
   });
 }
 
-/* ==================== 缓存（LRU 上限） ==================== */
+/* ==================== 缓存 ==================== */
 
 var traktHistoryCache = new Map();
 var tmdbShowCache = new Map();
@@ -167,12 +164,6 @@ function today() {
   return getDisplayDate(new Date());
 }
 
-function hasAired(value) {
-  if (!value) return false;
-  var day = getDisplayDate(String(value).slice(0, 10));
-  return !!day && day <= today();
-}
-
 function isRecent(item, days) {
   var t = safeTime(item && item.last_watched_at);
   if (t <= 0) return false;
@@ -185,10 +176,6 @@ function isRecent(item, days) {
 
 function getUser(params) {
   return String((params && params.traktUser) || "").trim();
-}
-
-function getClientId(params) {
-  return String((params && params.traktClientId) || "").trim();
 }
 
 function getPaging(params) {
@@ -211,17 +198,18 @@ function getTraktShowId(show) {
   return (show && show.ids && (show.ids.trakt || show.ids.slug)) || "";
 }
 
-function getTraktHeaders(clientId) {
+function getTraktHeaders() {
   return {
     "Content-Type": "application/json",
+    "User-Agent": "CapyPlayer/1.0",
     "trakt-api-version": "2",
-    "trakt-api-key": clientId
+    "trakt-api-key": PUBLIC_CLIENT_ID
   };
 }
 
-async function traktRequest(path, clientId, strict) {
+async function traktRequest(path, strict) {
   var response = await Widget.http.get(TRAKT_BASE + path, {
-    headers: getTraktHeaders(clientId),
+    headers: getTraktHeaders(),
     timeout: REQUEST_TIMEOUT_MS
   });
   if (!response) {
@@ -229,7 +217,10 @@ async function traktRequest(path, clientId, strict) {
     return null;
   }
   if (response.ok === false) {
-    if (strict) throw new Error("Trakt HTTP " + (response.status || "unknown"));
+    if (strict) {
+      throw new Error("Trakt HTTP " + (response.status || "unknown") +
+        (response.status === 429 ? "（请求过于频繁，请稍后重试）" : ""));
+    }
     return null;
   }
   var data = Array.isArray(response)
@@ -247,10 +238,10 @@ async function traktRequest(path, clientId, strict) {
   }
 }
 
-async function fetchAllTraktPages(pathBuilder, clientId) {
+async function fetchAllTraktPages(pathBuilder) {
   var all = [];
   for (var page = 1; page <= TRAKT_MAX_PAGES; page++) {
-    var data = await traktRequest(pathBuilder(page), clientId, page === 1);
+    var data = await traktRequest(pathBuilder(page), page === 1);
     if (data == null) {
       if (page > 1) console.warn("[trakt] 第 " + page + " 页为空，提前结束");
       break;
@@ -263,7 +254,7 @@ async function fetchAllTraktPages(pathBuilder, clientId) {
   return all;
 }
 
-async function fetchWatchedShows(user, clientId) {
+async function fetchWatchedShows(user) {
   return await fetchAllTraktPages(function (page) {
     return (
       "/users/" +
@@ -273,10 +264,10 @@ async function fetchWatchedShows(user, clientId) {
       "&limit=" +
       TRAKT_PAGE_LIMIT
     );
-  }, clientId);
+  });
 }
 
-async function fetchShowHistory(user, showId, clientId) {
+async function fetchShowHistory(user, showId) {
   return await fetchAllTraktPages(function (page) {
     return (
       "/users/" +
@@ -288,7 +279,7 @@ async function fetchShowHistory(user, showId, clientId) {
       "&limit=" +
       TRAKT_PAGE_LIMIT
     );
-  }, clientId);
+  });
 }
 
 /* ==================== 观看统计 ==================== */
@@ -316,14 +307,14 @@ function getWatchStats(item) {
   return { count: count, last: last };
 }
 
-async function fetchHighestWatched(user, show, clientId) {
+async function fetchHighestWatched(user, show) {
   var showId = getTraktShowId(show);
   if (!user || !showId) return null;
   return await cachedLoad(
     traktHistoryCache,
     user + ":" + showId,
     async function () {
-      var rows = await fetchShowHistory(user, showId, clientId);
+      var rows = await fetchShowHistory(user, showId);
       var last = null;
       var lastWatchedAt = null;
       for (var i = 0; i < rows.length; i++) {
@@ -479,7 +470,7 @@ function makeMedia(options) {
 
 /* ==================== 继续观看条目构建 ==================== */
 
-async function buildContinueItem(item, user, clientId) {
+async function buildContinueItem(item, user) {
   var show = item && item.show;
   if (!show) return null;
 
@@ -498,7 +489,7 @@ async function buildContinueItem(item, user, clientId) {
   var year = String(show.year || "");
 
   var results = await Promise.all([
-    fetchHighestWatched(user, show, clientId),
+    fetchHighestWatched(user, show),
     loadTmdbShow(tmdbId)
   ]);
   var history = results[0];
@@ -568,21 +559,12 @@ async function loadContinueWatching(params) {
       );
     }
 
-    var clientId = getClientId(params);
-    if (!clientId) {
-      return textItem(
-        "need-client-id",
-        "请配置 Trakt Client ID",
-        "前往 trakt.tv/oauth/applications 创建应用后获取 Client ID"
-      );
-    }
-
     var paging = getPaging(params);
     var page = paging.page;
     var pageSize = paging.pageSize;
     var recentDays = getRecentDays(params);
 
-    var watched = await fetchWatchedShows(user, clientId);
+    var watched = await fetchWatchedShows(user);
     if (!watched.length) {
       return textItem("empty", "没有观看记录", "该 Trakt 账号暂无剧集观看记录");
     }
@@ -612,7 +594,7 @@ async function loadContinueWatching(params) {
     var results = [];
     for (var i = 0; i < slice.length; i++) {
       try {
-        var media = await buildContinueItem(slice[i], user, clientId);
+        var media = await buildContinueItem(slice[i], user);
         if (media) results.push(media);
       } catch (err) {
         console.warn(
