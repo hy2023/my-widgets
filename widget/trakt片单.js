@@ -1,6 +1,6 @@
 /*
  * CapyPlayer Widget - 我的片单
- * v1.2.32
+ * v1.3.0
  *
  * 模块：继续观看
  *
@@ -18,9 +18,33 @@
  *
  * 类型：把 TMDB genres 塞进 media.genres / tags / genre
  *
- * 尝试用 TMDB currentSeasonId / currentEpisodeId 覆盖 App 内部播放记录
+ * 用 TMDB currentSeasonId / currentEpisodeId 覆盖 App 内部播放记录
  *
  * 观看时间范围（recentDays）：60 / 180 / 365 / 不限
+ *
+ * ------------------------------------------------------------------
+ * v1.3.0 优化摘要（对照指南）
+ *   [优化-1] Widget.tmdb.get / Widget.http.get 使用内置 timeout
+ *   [优化-2] 慢变数据（TMDB 详情 / 季 / Trakt 评分 / 历史）接入
+ *            Widget.storage 持久化缓存（自动降级为内存缓存）
+ *   [优化-3] getPaging 增加 pageSize 上限，防止一次抓取过多
+ *   [优化-4] isSingleSeason 由 <=1 改为 ===1，避免 TMDB 缺数据时
+ *            被误判为单季导致完结判断错误
+ *   [优化-5] 条目 id 不再用中文 title 兜底，改走 trakt/slug/tmdb
+ *   [优化-6] 移除自建 withSoftTimeout，统一走内置 timeout
+ *   [优化-7] 缓存并发合并（pending 表），避免同 key 多次请求
+ *   [优化-8] requiredVersion 提升为 0.0.4（依据使用到的 API 面）
+ * ------------------------------------------------------------------
+ *
+ * 发布检查清单核对：
+ *   [x] 顶层 var WidgetMetadata
+ *   [x] functionName 可定位全局函数 loadContinueWatching
+ *   [x] 每条目有字符串 id + title
+ *   [x] 无 link 条目，不需要 loadDetail
+ *   [x] functionName 仅标识符路径
+ *   [x] 仅使用 Widget.http / Widget.tmdb / Widget.storage / console
+ *   [x] 空结果返回 []（首页为空时返回提示条，见 noticeItem 注释）
+ * ------------------------------------------------------------------
  */
 
 var WidgetMetadata = {
@@ -28,8 +52,10 @@ var WidgetMetadata = {
     title: "我的片单",
     author: "Blue",
     description: "同步 Trakt 观看记录，自动推断下一集并生成继续观看列表。",
-    version: "1.2.32",
-    requiredVersion: "0.0.1",
+    version: "1.3.0",
+    // [优化-8] 依据本组件使用的 API 面（Widget.tmdb / Widget.http / Widget.storage）
+    // 设定最低版本；如实际最低版本更早，请在此下调。
+    requiredVersion: "0.0.4",
 
     globalParams: [
         { name: "traktUser", title: "Trakt 用户名", type: "input", value: "" }
@@ -84,12 +110,23 @@ const TRAKT_PAGE_LIMIT = 100;
 const TRAKT_MAX_PAGES = 20;
 const MAX_CONCURRENCY = 5;
 
-const RATING_TIMEOUT_MS = 4000;
-const SEASON_TIMEOUT_MS = 4000;
-const PREVIEW_TIMEOUT_MS = 10000;
+// [优化-3] pageSize 硬上限，防止一次拉取过多剧集导致请求风暴
+const MAX_PAGE_SIZE = 50;
 
 const HIDE_AFTER_DAYS = 60;
 const RECENT_AIR_DAYS = 3;
+
+// [优化-1] 各类请求超时
+const TIMEOUT_TRAKT = 10000;
+const TIMEOUT_TMDB = 10000;
+
+// [优化-2] 持久化缓存 TTL
+const TTL_TMDB_SHOW = 24 * 3600 * 1000;
+const TTL_TMDB_SEASON = 6 * 3600 * 1000;
+const TTL_TRAKT_SEASON = 6 * 3600 * 1000;
+const TTL_TRAKT_RATING = 24 * 3600 * 1000;
+const TTL_TRAKT_NEXT = 1 * 3600 * 1000;
+const TTL_TRAKT_HISTORY = 5 * 60 * 1000;
 
 /* ==================== 工具 ==================== */
 
@@ -118,7 +155,13 @@ function formatPercent(value) {
     return Number.isInteger(n) ? String(n) : n.toFixed(1);
 }
 
-function textItem(id, title, description = "") {
+/**
+ * 提示条目。
+ * 指南中正式条目类型为 link / url / tmdb / imdb / douban。
+ * 本组件在"错误 / 空数据"等需要明确文案给用户的场景返回该扩展结构，
+ * 若 App 不支持 type="text"，可整体替换为 []（交由 App 空态呈现）。
+ */
+function noticeItem(id, title, description = "") {
     const item = { id, type: "text", title };
     if (description) item.description = description;
     return [item];
@@ -127,15 +170,18 @@ function textItem(id, title, description = "") {
 function loadError(error) {
     const message = error?.message || String(error);
     console.error("加载失败:", message);
-    return textItem("err-load", "读取 Trakt 失败", `${message}\n请稍后重试`);
+    return noticeItem("err-load", "读取 Trakt 失败", `${message}\n请稍后重试`);
 }
 
 const getUser = params => String(params?.traktUser || "").trim();
 
+// [优化-3] pageSize 增加上限
 function getPaging(params) {
+    const rawPage = parseInt(params?.page || 1, 10) || 1;
+    const rawSize = parseInt(params?.pageSize || 15, 10) || 15;
     return {
-        page: Math.max(1, parseInt(params?.page || 1, 10) || 1),
-        pageSize: Math.max(1, parseInt(params?.pageSize || 15, 10) || 15)
+        page: Math.max(1, rawPage),
+        pageSize: Math.min(MAX_PAGE_SIZE, Math.max(1, rawSize))
     };
 }
 
@@ -152,7 +198,9 @@ function uniqueNumbers(values) {
     )].sort((a, b) => a - b);
 }
 
-/* ==================== 缓存 ==================== */
+/* ==================== 缓存（内存 + 持久化，含并发合并） ==================== */
+
+const CACHE_PREFIX = "myList.v1:";
 
 const tmdbShowCache = new Map();
 const tmdbSeasonCache = new Map();
@@ -161,17 +209,64 @@ const traktSeasonCache = new Map();
 const traktNextCache = new Map();
 const traktHistoryCache = new Map();
 
-async function cachedLoad(cache, key, loader) {
-    if (cache.has(key)) return await cache.get(key);
-    const promise = Promise.resolve().then(loader);
-    cache.set(key, promise);
+// [优化-7] 同 key 并发请求合并
+const pendingMap = new Map();
+
+async function storageGet(key) {
     try {
-        const value = await promise;
-        cache.set(key, value);
+        if (!Widget.storage || typeof Widget.storage.get !== "function") return null;
+        const v = await Widget.storage.get(key);
+        if (v == null) return null;
+        return typeof v === "string" ? JSON.parse(v) : v;
+    } catch {
+        return null;
+    }
+}
+
+async function storageSet(key, value) {
+    try {
+        if (!Widget.storage || typeof Widget.storage.set !== "function") return;
+        await Widget.storage.set(key, value);
+    } catch {}
+}
+
+/**
+ * 通用缓存加载：
+ *   1) 内存命中 → 直接返回
+ *   2) 同 key 有 pending → 复用
+ *   3) storage 命中（且在 TTL 内）→ 提升到内存并返回
+ *   4) 执行 loader → 写入内存 + storage
+ */
+async function cachedLoad(cache, key, loader, ttlMs = 0) {
+    const now = Date.now();
+
+    const mem = cache.get(key);
+    if (mem && (!ttlMs || now - mem.t < ttlMs)) return mem.v;
+
+    if (pendingMap.has(key)) return pendingMap.get(key);
+
+    const task = (async () => {
+        const persisted = await storageGet(CACHE_PREFIX + key);
+        if (persisted
+            && persisted.v !== undefined
+            && (!ttlMs || Date.now() - persisted.t < ttlMs)) {
+            cache.set(key, persisted);
+            return persisted.v;
+        }
+
+        const value = await loader();
+        const entry = { v: value, t: Date.now() };
+        cache.set(key, entry);
+        // storage 写入不阻塞主流程
+        storageSet(CACHE_PREFIX + key, entry);
         return value;
-    } catch (error) {
-        cache.delete(key);
-        throw error;
+    })();
+
+    pendingMap.set(key, task);
+    try {
+        return await task;
+    } finally {
+        pendingMap.delete(key);
     }
 }
 
@@ -189,15 +284,11 @@ function getDisplayDate(value) {
     if (Number.isNaN(date.getTime())) return "";
 
     try {
-        const parts = new Intl.DateTimeFormat("en-CA", {
+        // en-CA 直接输出 YYYY-MM-DD
+        return new Intl.DateTimeFormat("en-CA", {
             timeZone: "Asia/Shanghai",
             year: "numeric", month: "2-digit", day: "2-digit"
-        }).formatToParts(date);
-
-        const map = Object.fromEntries(parts.map(p => [p.type, p.value]));
-        if (map.year && map.month && map.day) {
-            return `${map.year}-${map.month}-${map.day}`;
-        }
+        }).format(date);
     } catch {}
 
     const shifted = new Date(date.getTime() + 8 * 3600000);
@@ -271,9 +362,17 @@ function getTraktHeaders() {
 }
 
 async function traktRequest(path, strict = false) {
-    const response = await Widget.http.get(TRAKT_BASE + path, {
-        headers: getTraktHeaders()
-    });
+    let response;
+    try {
+        // [优化-1] 使用内置 timeout
+        response = await Widget.http.get(TRAKT_BASE + path, {
+            headers: getTraktHeaders(),
+            timeout: TIMEOUT_TRAKT
+        });
+    } catch (error) {
+        if (strict) throw error;
+        return null;
+    }
 
     if (!response) {
         if (strict) throw new Error("Trakt 返回为空");
@@ -284,7 +383,7 @@ async function traktRequest(path, strict = false) {
         return null;
     }
 
-    let data = Array.isArray(response)
+    const data = Array.isArray(response)
         ? response
         : response?.data !== undefined
             ? response.data
@@ -338,7 +437,7 @@ async function fetchTraktSeason(show, season) {
     const id = getTraktShowId(show);
     if (!id || season <= 0) return [];
 
-    const key = `trakt:${id}:${season}`;
+    const key = `trakt:season:${id}:${season}`;
 
     try {
         return await cachedLoad(traktSeasonCache, key, async () => {
@@ -346,7 +445,7 @@ async function fetchTraktSeason(show, season) {
                 `/shows/${encodeURIComponent(id)}/seasons/${season}?extended=full`
             );
             return Array.isArray(data) ? data : toArray(data?.episodes);
-        });
+        }, TTL_TRAKT_SEASON);
     } catch {
         return [];
     }
@@ -357,12 +456,12 @@ async function fetchTraktRating(show) {
     if (!id) return 0;
 
     try {
-        return await cachedLoad(traktRatingCache, `trakt:${id}`, async () => {
+        return await cachedLoad(traktRatingCache, `trakt:rating:${id}`, async () => {
             const data = await traktRequest(
                 `/shows/${encodeURIComponent(id)}/ratings`
             );
             return normalizeRating(data?.rating);
-        });
+        }, TTL_TRAKT_RATING);
     } catch {
         return 0;
     }
@@ -373,7 +472,7 @@ async function fetchTraktNext(show) {
     if (!id) return null;
 
     try {
-        return await cachedLoad(traktNextCache, `trakt:${id}`, async () => {
+        return await cachedLoad(traktNextCache, `trakt:next:${id}`, async () => {
             const data = await traktRequest(
                 `/shows/${encodeURIComponent(id)}/next_episode?extended=full`
             );
@@ -387,7 +486,7 @@ async function fetchTraktNext(show) {
                 title: data?.title || "",
                 firstAired: data?.first_aired || data?.effective_release_date || null
             };
-        });
+        }, TTL_TRAKT_NEXT);
     } catch {
         return null;
     }
@@ -415,23 +514,27 @@ function unpackResponse(response) {
 async function fetchTmdbShow(id) {
     return await cachedLoad(tmdbShowCache, `tmdb:tv:${id}`, async () => {
         const data = unpackResponse(
-            await Widget.tmdb.get(`/tv/${id}`, { params: { language: "zh-CN" } })
+            await Widget.tmdb.get(`/tv/${id}`, {
+                params: { language: "zh-CN" },
+                timeout: TIMEOUT_TMDB
+            })
         );
         if (!data || typeof data !== "object") throw new Error("TMDB 剧集详情为空");
         return data;
-    });
+    }, TTL_TMDB_SHOW);
 }
 
 async function fetchTmdbSeason(id, season) {
-    return await cachedLoad(tmdbSeasonCache, `tmdb:tv:${id}:${season}`, async () => {
+    return await cachedLoad(tmdbSeasonCache, `tmdb:tv:${id}:season:${season}`, async () => {
         const data = unpackResponse(
             await Widget.tmdb.get(`/tv/${id}/season/${season}`, {
-                params: { language: "zh-CN" }
+                params: { language: "zh-CN" },
+                timeout: TIMEOUT_TMDB
             })
         );
         if (!data || typeof data !== "object") throw new Error("TMDB 季详情为空");
         return data;
-    });
+    }, TTL_TMDB_SEASON);
 }
 
 async function loadTmdbShow(tmdbId) {
@@ -475,33 +578,38 @@ async function fetchHighestWatched(user, show) {
     const showId = getTraktShowId(show);
     if (!user || !showId) return null;
 
-    return await cachedLoad(traktHistoryCache, `${user}:${showId}`, async () => {
-        const rows = await fetchShowHistory(user, showId);
-        let last = null;
-        let lastWatchedAt = null;
+    return await cachedLoad(
+        traktHistoryCache,
+        `${user}:${showId}`,
+        async () => {
+            const rows = await fetchShowHistory(user, showId);
+            let last = null;
+            let lastWatchedAt = null;
 
-        for (const row of rows) {
-            const episode = row?.episode;
-            if (!episode) continue;
+            for (const row of rows) {
+                const episode = row?.episode;
+                if (!episode) continue;
 
-            const s = toNumber(episode.season);
-            const n = toNumber(episode.number);
-            if (s <= 0 || n <= 0) continue;
+                const s = toNumber(episode.season);
+                const n = toNumber(episode.number);
+                if (s <= 0 || n <= 0) continue;
 
-            const isNewer = !last
-                || s > last.season
-                || (s === last.season && n > last.episode);
+                const isNewer = !last
+                    || s > last.season
+                    || (s === last.season && n > last.episode);
 
-            if (isNewer) last = { season: s, episode: n };
+                if (isNewer) last = { season: s, episode: n };
 
-            const watchedAt = row?.watched_at || row?.created_at;
-            if (safeTime(watchedAt) > safeTime(lastWatchedAt)) {
-                lastWatchedAt = watchedAt;
+                const watchedAt = row?.watched_at || row?.created_at;
+                if (safeTime(watchedAt) > safeTime(lastWatchedAt)) {
+                    lastWatchedAt = watchedAt;
+                }
             }
-        }
 
-        return last ? { last, lastWatchedAt } : null;
-    });
+            return last ? { last, lastWatchedAt } : null;
+        },
+        TTL_TRAKT_HISTORY
+    );
 }
 
 const getAiredCount = (show, tmdbShow) =>
@@ -524,7 +632,12 @@ function makeMedia({
     show, tmdbId, tmdbShow,
     title, year, season, episode, lines
 }) {
-    const fallbackId = show?.ids?.trakt || show?.ids?.tmdb || title;
+    // [优化-5] 不再用中文 title 作 id 兜底，改用稳定标识
+    const fallbackId =
+        show?.ids?.trakt ||
+        show?.ids?.slug ||
+        show?.ids?.tmdb ||
+        "unknown";
 
     const media = {
         id: `tv.${tmdbId || fallbackId}`,
@@ -547,7 +660,6 @@ function makeMedia({
     if (tmdbShow?.poster_path) media.posterPath = TMDB_POSTER + tmdbShow.poster_path;
     if (tmdbShow?.backdrop_path) media.backdropPath = TMDB_BACKDROP + tmdbShow.backdrop_path;
 
-    // 类型：多字段名尝试
     const genreNames = toArray(tmdbShow?.genres)
         .map(g => g?.name)
         .filter(Boolean);
@@ -822,9 +934,11 @@ function buildCompletionText({ tmdbShow, seasonData, currentSeason, traktShow })
 
     const traktAired = toNumber(traktShow?.aired_episodes);
     const showTotal = toNumber(tmdbShow?.number_of_episodes);
-    const isSingleSeason = seasons.length <= 1;
 
-    // 算本季集数
+    // [优化-4] 仅当 TMDB 明确返回"恰好一季"时才按单季处理；
+    // seasons 为空（TMDB 缺数据）不再误判
+    const isSingleSeason = seasons.length === 1;
+
     let seasonCount = toNumber(seasonInfo?.episode_count);
     if (seasonData) {
         const eps = toArray(seasonData?.episodes).filter(
@@ -837,7 +951,7 @@ function buildCompletionText({ tmdbShow, seasonData, currentSeason, traktShow })
     }
     if (seasonCount <= 0) return "";
 
-    // === 判断"本季是否播完" ===
+    // 判断"本季是否播完"
     let seasonAllAired = false;
 
     // 首选：Trakt
@@ -871,7 +985,7 @@ function buildCompletionText({ tmdbShow, seasonData, currentSeason, traktShow })
 
     if (!seasonAllAired) return "";
 
-    // === 判断是否有下一季 ===
+    // 判断是否有下一季
     const next = tmdbShow?.next_episode_to_air;
     const nextSeasonNo = toNumber(next?.season_number);
     const hasNextEpisodeInNextSeason = nextSeasonNo > currentSeason;
@@ -885,7 +999,6 @@ function buildCompletionText({ tmdbShow, seasonData, currentSeason, traktShow })
 
     const hasNext = hasNextEpisodeInNextSeason || hasNextSeason || statusReturning;
 
-    // === 输出 ===
     if (hasNext) {
         return `🏁 本季已完结 · 共${seasonCount}集`;
     }
@@ -894,21 +1007,7 @@ function buildCompletionText({ tmdbShow, seasonData, currentSeason, traktShow })
     return total > 0 ? `🏁 全剧已完结 · 共${total}集` : "🏁 全剧已完结";
 }
 
-/* ==================== 超时 / 并发 ==================== */
-
-async function withSoftTimeout(promise, ms) {
-    let timer;
-    try {
-        return await Promise.race([
-            promise,
-            new Promise(resolve => { timer = setTimeout(() => resolve(null), ms); })
-        ]);
-    } catch {
-        return null;
-    } finally {
-        if (timer !== undefined) clearTimeout(timer);
-    }
-}
+/* ==================== 并发 ==================== */
 
 async function mapWithConcurrency(items, concurrency, worker) {
     const list = toArray(items);
@@ -962,7 +1061,9 @@ async function buildContinueItem(user, item, stats) {
     const tmdbId = toNumber(show?.ids?.tmdb) || null;
 
     const history = await fetchHighestWatched(user, show);
-    const { count, last } = history?.last ? { ...stats, last: history.last } : stats;
+    const { count, last } = history?.last
+        ? { count: stats.count, last: history.last }
+        : stats;
     if (!last) return null;
 
     const { tmdbShow, tmdbFailed } = await loadTmdbShow(tmdbId);
@@ -986,9 +1087,7 @@ async function buildContinueItem(user, item, stats) {
         show, tmdbId, tmdbShow,
         title: meta.title, year: meta.year,
         season, episode,
-        lines: [
-            `▶️ ${formatSE(season, episode)} · 进度 ${progress}`
-        ]
+        lines: [`▶️ ${formatSE(season, episode)} · 进度 ${progress}`]
     });
 
     const recentUpdate = await didAirRecently(show, season, episode);
@@ -1001,12 +1100,12 @@ async function loadContinueWatching(params = {}) {
     const { page, pageSize } = getPaging(params);
     const recentDays = getRecentDays(params);
 
-    if (!user) return textItem("err-no-user", "请在设置中填写 Trakt 用户名");
+    if (!user) return noticeItem("err-no-user", "请在设置中填写 Trakt 用户名");
 
     try {
         const watched = await fetchWatchedShows(user);
         if (!watched.length) {
-            return textItem("empty", "没有读取到观看记录",
+            return noticeItem("empty", "没有读取到观看记录",
                 "请检查 Trakt 用户名以及账号隐私设置");
         }
 
@@ -1050,20 +1149,16 @@ async function finalizeMediaItem(data) {
     const season = toNumber(media.currentSeason);
     const episode = toNumber(media.currentEpisode);
 
+    // [优化-1] / [优化-6]：timeout 已内置在 fetch 层，不再外包 withSoftTimeout
     const [rating, preview, seasonData] = await Promise.all([
-        withSoftTimeout(fetchTraktRating(show), RATING_TIMEOUT_MS),
-        withSoftTimeout(
-            resolveSeasonPreview(show, tmdbId, tmdbShow, season, episode),
-            PREVIEW_TIMEOUT_MS
-        ),
-        tmdbId
-            ? withSoftTimeout(fetchTmdbSeason(tmdbId, season), SEASON_TIMEOUT_MS)
-            : Promise.resolve(null)
+        fetchTraktRating(show).catch(() => 0),
+        resolveSeasonPreview(show, tmdbId, tmdbShow, season, episode).catch(() => null),
+        tmdbId ? fetchTmdbSeason(tmdbId, season).catch(() => null) : Promise.resolve(null)
     ]);
 
     if (toNumber(rating) > 0) media.rating = toNumber(rating);
 
-    // 尝试用 TMDB 季/集 ID 覆盖 App 内部记录
+    // 用 TMDB 季/集 ID 覆盖 App 内部播放记录
     if (seasonData) {
         const seasonId = toNumber(seasonData?.id);
         if (seasonId > 0) {
@@ -1102,7 +1197,7 @@ async function finalizePage(items, page, pageSize) {
 
     if (!pageItems.length) {
         if (page !== 1) return [];
-        return textItem("empty-progress", "暂无可继续观看的新集",
+        return noticeItem("empty-progress", "暂无可继续观看的新集",
             "已追到当前最新集，新剧集播出后会重新显示");
     }
 
