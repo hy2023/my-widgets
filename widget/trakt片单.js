@@ -1,5 +1,5 @@
 /*
- * CapyPlayer Widget - trakt片单
+ * CapyPlayer Widget - Trakt片单
  * v1.3.0
  *
  * 模块：继续观看
@@ -200,7 +200,7 @@ function uniqueNumbers(values) {
 
 /* ==================== 缓存（内存 + 持久化，含并发合并） ==================== */
 
-const CACHE_PREFIX = "myList.v1:";
+const CACHE_PREFIX = "traktList.v1:";
 
 const tmdbShowCache = new Map();
 const tmdbSeasonCache = new Map();
