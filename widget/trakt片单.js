@@ -49,7 +49,7 @@
 
 var WidgetMetadata = {
     id: "trakt_continue_username",
-    title: "我的片单",
+    title: "Trakt片单",
     author: "Blue",
     description: "同步 Trakt 观看记录，自动推断下一集并生成继续观看列表。",
     version: "1.3.0",
