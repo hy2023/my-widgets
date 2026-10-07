@@ -1,5 +1,5 @@
 /*
- * CapyPlayer Widget - 我的片单
+ * CapyPlayer Widget - trakt片单
  * v1.3.0
  *
  * 模块：继续观看
