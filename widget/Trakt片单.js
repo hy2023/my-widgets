@@ -1,6 +1,6 @@
 /*
  * CapyPlayer Widget - Trakt片单
- * v1.3.0
+ * v1.3.1
  *
  * 模块：继续观看
  *
@@ -23,27 +23,17 @@
  * 观看时间范围（recentDays）：60 / 180 / 365 / 不限
  *
  * ------------------------------------------------------------------
- * v1.3.0 优化摘要（对照指南）
- *   [优化-1] Widget.tmdb.get / Widget.http.get 使用内置 timeout
- *   [优化-2] 慢变数据（TMDB 详情 / 季 / Trakt 评分 / 历史）接入
- *            Widget.storage 持久化缓存（自动降级为内存缓存）
- *   [优化-3] getPaging 增加 pageSize 上限，防止一次抓取过多
- *   [优化-4] isSingleSeason 由 <=1 改为 ===1，避免 TMDB 缺数据时
- *            被误判为单季导致完结判断错误
- *   [优化-5] 条目 id 不再用中文 title 兜底，改走 trakt/slug/tmdb
- *   [优化-6] 移除自建 withSoftTimeout，统一走内置 timeout
- *   [优化-7] 缓存并发合并（pending 表），避免同 key 多次请求
- *   [优化-8] requiredVersion 提升为 0.0.4（依据使用到的 API 面）
- * ------------------------------------------------------------------
- *
- * 发布检查清单核对：
- *   [x] 顶层 var WidgetMetadata
- *   [x] functionName 可定位全局函数 loadContinueWatching
- *   [x] 每条目有字符串 id + title
- *   [x] 无 link 条目，不需要 loadDetail
- *   [x] functionName 仅标识符路径
- *   [x] 仅使用 Widget.http / Widget.tmdb / Widget.storage / console
- *   [x] 空结果返回 []（首页为空时返回提示条，见 noticeItem 注释）
+ * v1.3.1 优化摘要
+ *   [优化-1]  Widget.tmdb.get / Widget.http.get 使用内置 timeout
+ *   [优化-2]  慢变数据接入 Widget.storage 持久化缓存（可降级）
+ *   [优化-3]  getPaging 增加 pageSize 上限
+ *   [优化-4]  isSingleSeason 由 <=1 改为 ===1
+ *   [优化-5]  条目 id 不再用中文 title 兜底
+ *   [优化-6]  移除自建 withSoftTimeout，统一走内置 timeout
+ *   [优化-7]  缓存并发合并（pending 表）
+ *   [优化-8]  requiredVersion 提升为 0.0.4
+ *   [优化-9]  Trakt 请求超时由 10s 提升到 25s，并加入自动重试
+ *   [优化-10] 错误提示区分「超时 / 网络 / 其他」三类，更可操作
  * ------------------------------------------------------------------
  */
 
@@ -52,9 +42,8 @@ var WidgetMetadata = {
     title: "Trakt片单",
     author: "Blue",
     description: "同步 Trakt 观看记录，自动推断下一集并生成继续观看列表。",
-    version: "1.3.0",
-    // [优化-8] 依据本组件使用的 API 面（Widget.tmdb / Widget.http / Widget.storage）
-    // 设定最低版本；如实际最低版本更早，请在此下调。
+    version: "1.3.1",
+    // [优化-8] 依据本组件使用的 API 面设定最低版本
     requiredVersion: "0.0.4",
 
     globalParams: [
@@ -110,15 +99,19 @@ const TRAKT_PAGE_LIMIT = 100;
 const TRAKT_MAX_PAGES = 20;
 const MAX_CONCURRENCY = 5;
 
-// [优化-3] pageSize 硬上限，防止一次拉取过多剧集导致请求风暴
+// [优化-3] pageSize 硬上限
 const MAX_PAGE_SIZE = 50;
 
 const HIDE_AFTER_DAYS = 60;
 const RECENT_AIR_DAYS = 3;
 
-// [优化-1] 各类请求超时
-const TIMEOUT_TRAKT = 10000;
-const TIMEOUT_TMDB = 10000;
+// [优化-1] / [优化-9] 请求超时调大，以适配较慢的网络环境
+const TIMEOUT_TRAKT = 25000;
+const TIMEOUT_TMDB = 25000;
+
+// [优化-9] 自动重试配置
+const MAX_RETRY = 2;
+const RETRY_DELAY_MS = 800;
 
 // [优化-2] 持久化缓存 TTL
 const TTL_TMDB_SHOW = 24 * 3600 * 1000;
@@ -167,9 +160,26 @@ function noticeItem(id, title, description = "") {
     return [item];
 }
 
+// [优化-10] 按错误类型区分提示，用户可据此采取不同措施
 function loadError(error) {
     const message = error?.message || String(error);
     console.error("加载失败:", message);
+
+    if (/timeout|timed out|aborted/i.test(message)) {
+        return noticeItem(
+            "err-timeout",
+            "读取 Trakt 超时",
+            "当前网络访问 Trakt 较慢或不可达。\n" +
+            "请检查网络环境，或尝试开启代理后重试。"
+        );
+    }
+    if (/connection|network|socket|dns|host/i.test(message)) {
+        return noticeItem(
+            "err-network",
+            "网络连接失败",
+            "无法连接 Trakt 服务器，请检查网络后重试。"
+        );
+    }
     return noticeItem("err-load", "读取 Trakt 失败", `${message}\n请稍后重试`);
 }
 
@@ -284,7 +294,6 @@ function getDisplayDate(value) {
     if (Number.isNaN(date.getTime())) return "";
 
     try {
-        // en-CA 直接输出 YYYY-MM-DD
         return new Intl.DateTimeFormat("en-CA", {
             timeZone: "Asia/Shanghai",
             year: "numeric", month: "2-digit", day: "2-digit"
@@ -361,43 +370,56 @@ function getTraktHeaders() {
     };
 }
 
+// [优化-9] 带自动重试的 Trakt 请求
 async function traktRequest(path, strict = false) {
-    let response;
-    try {
-        // [优化-1] 使用内置 timeout
-        response = await Widget.http.get(TRAKT_BASE + path, {
-            headers: getTraktHeaders(),
-            timeout: TIMEOUT_TRAKT
-        });
-    } catch (error) {
-        if (strict) throw error;
-        return null;
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
+        try {
+            // [优化-1] 使用内置 timeout
+            const response = await Widget.http.get(TRAKT_BASE + path, {
+                headers: getTraktHeaders(),
+                timeout: TIMEOUT_TRAKT
+            });
+
+            if (!response) {
+                lastError = new Error("Trakt 返回为空");
+            } else if (response.ok === false) {
+                lastError = new Error(
+                    `Trakt HTTP ${response.status || "unknown"}`
+                );
+            } else {
+                const data = Array.isArray(response)
+                    ? response
+                    : response?.data !== undefined
+                        ? response.data
+                        : response;
+
+                if (typeof data !== "string") return data;
+                if (!data.trim()) return null;
+
+                try {
+                    return JSON.parse(data);
+                } catch (parseError) {
+                    lastError = parseError;
+                }
+            }
+        } catch (error) {
+            lastError = error;
+        }
+
+        // 最后一次失败不再等待，直接抛出/返回
+        if (attempt < MAX_RETRY) {
+            console.warn(
+                `Trakt 请求失败，${RETRY_DELAY_MS}ms 后重试 ` +
+                `(${attempt + 1}/${MAX_RETRY})：${path}`
+            );
+            await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+        }
     }
 
-    if (!response) {
-        if (strict) throw new Error("Trakt 返回为空");
-        return null;
-    }
-    if (response.ok === false) {
-        if (strict) throw new Error(`Trakt HTTP ${response.status || "unknown"}`);
-        return null;
-    }
-
-    const data = Array.isArray(response)
-        ? response
-        : response?.data !== undefined
-            ? response.data
-            : response;
-
-    if (typeof data !== "string") return data;
-    if (!data.trim()) return null;
-
-    try {
-        return JSON.parse(data);
-    } catch (error) {
-        if (strict) throw error;
-        return null;
-    }
+    if (strict) throw lastError || new Error("Trakt 请求失败");
+    return null;
 }
 
 async function fetchAllTraktPages(pathBuilder) {
@@ -935,8 +957,7 @@ function buildCompletionText({ tmdbShow, seasonData, currentSeason, traktShow })
     const traktAired = toNumber(traktShow?.aired_episodes);
     const showTotal = toNumber(tmdbShow?.number_of_episodes);
 
-    // [优化-4] 仅当 TMDB 明确返回"恰好一季"时才按单季处理；
-    // seasons 为空（TMDB 缺数据）不再误判
+    // [优化-4] 仅当 TMDB 明确返回"恰好一季"时才按单季处理
     const isSingleSeason = seasons.length === 1;
 
     let seasonCount = toNumber(seasonInfo?.episode_count);
@@ -1149,7 +1170,7 @@ async function finalizeMediaItem(data) {
     const season = toNumber(media.currentSeason);
     const episode = toNumber(media.currentEpisode);
 
-    // [优化-1] / [优化-6]：timeout 已内置在 fetch 层，不再外包 withSoftTimeout
+    // [优化-1] / [优化-6]：timeout 已内置在 fetch 层
     const [rating, preview, seasonData] = await Promise.all([
         fetchTraktRating(show).catch(() => 0),
         resolveSeasonPreview(show, tmdbId, tmdbShow, season, episode).catch(() => null),
