@@ -1,6 +1,6 @@
 /*
  * CapyPlayer Widget - Trakt片单
- * v1.3.1
+ * v1.0.1
  *
  * 模块：继续观看
  *
@@ -23,7 +23,7 @@
  * 观看时间范围（recentDays）：60 / 180 / 365 / 不限
  *
  * ------------------------------------------------------------------
- * v1.3.1 优化摘要
+ * v1.0.1 优化摘要
  *   [优化-1]  Widget.tmdb.get / Widget.http.get 使用内置 timeout
  *   [优化-2]  慢变数据接入 Widget.storage 持久化缓存（可降级）
  *   [优化-3]  getPaging 增加 pageSize 上限
@@ -42,7 +42,7 @@ var WidgetMetadata = {
     title: "Trakt片单",
     author: "Holyn",
     description: "同步 Trakt 观看记录，自动推断下一集并生成继续观看列表。",
-    version: "1.3.1",
+    version: "1.0.1",
     // [优化-8] 依据本组件使用的 API 面设定最低版本
     requiredVersion: "0.0.4",
 
