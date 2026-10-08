@@ -1,6 +1,6 @@
 /*
  * CapyPlayer Widget - Trakt片单
- * v2.0.0
+ * v2.0.1
  *
  * 核心逻辑：
  *   1. 读取 Trakt watched/shows?extended=progress
@@ -18,11 +18,11 @@ var WidgetMetadata = {
     title: "Trakt片单",
     author: "Holyn",
     description: "同步 Trakt 观看进度，自动推断下一集并生成继续观看列表。",
-    version: "2.0.0",
+    version: "2.0.1",
     requiredVersion: "0.0.4",
 
     globalParams: [
-        { name: "traktUser", title: "Trakt 用户名", type: "input", value: "" }
+        { name: "traktUser", title: "Trakt 用户名", type: "string", defaultValue: "" }
     ],
 
     modules: [
@@ -36,8 +36,8 @@ var WidgetMetadata = {
                 {
                     name: "pageSize",
                     title: "每页数量",
-                    type: "enumeration",
-                    value: "15",
+                    type: "enum",
+                    defaultValue: "15",
                     enumOptions: [
                         { title: "10", value: "10" },
                         { title: "15", value: "15" },
@@ -47,8 +47,8 @@ var WidgetMetadata = {
                 {
                     name: "recentDays",
                     title: "筛选范围",
-                    type: "enumeration",
-                    value: "60",
+                    type: "enum",
+                    defaultValue: "60",
                     enumOptions: [
                         { title: "最近 60 天", value: "60" },
                         { title: "最近 180 天", value: "180" },
@@ -357,9 +357,6 @@ async function fetchAllTraktPages(pathBuilder) {
  * 核心数据源：
  * 一次读取 watched/shows + progress。
  *
- * 不再针对每部剧调用：
- * /users/{user}/history/shows/{showId}
- *
  * watched progress 已用于计算最高已观看集；
  * item.last_watched_at 用于该剧的最近观看时间和排序。
  */
@@ -530,15 +527,6 @@ async function loadTmdbShow(tmdbId) {
 
 /* ==================== 观看进度 ==================== */
 
-/*
- * 从 Trakt watched/shows 的 progress 数据直接计算：
- *   count = 已观看集数
- *   last  = 最高已观看 S/E
- *   lastWatchedAt = 该剧最近一次观看时间
- *
- * 这里的 last 是“最高集数”，不是“最近一次观看的具体集”。
- * 对继续观看而言，最高 S/E 才适合推断下一集。
- */
 function getWatchStats(item) {
     let count = 0;
     let last = null;
@@ -607,10 +595,6 @@ async function inferNextEpisode(
 
     /*
      * 1. Trakt 当前季
-     *
-     * 如果当前季明确存在下一集：
-     *   已播 → 直接继续
-     *   未播 → 不显示，避免提前进入未来集
      */
     const currentSeason = await fetchTraktSeason(
         show,
@@ -630,8 +614,6 @@ async function inferNextEpisode(
 
     /*
      * 2. Trakt next_episode
-     *
-     * 当前季找不到时，直接使用 Trakt 的下一集结果。
      */
     const traktNext = await fetchTraktNext(show);
 
@@ -672,8 +654,6 @@ async function inferNextEpisode(
 
         /*
          * 4. TMDB 下一季
-         *
-         * 当前季没有下一集时，检查下一季第 1 集。
          */
         const nextSeason = last.season + 1;
 
@@ -740,10 +720,6 @@ function makeMedia({
     count,
     aired
 }) {
-    /*
-     * type=tmdb 时必须优先使用稳定的 TMDB ID。
-     * 没有 TMDB ID 的剧不进入最终列表，避免生成无法正确定位的条目。
-     */
     if (!tmdbId) return null;
 
     const progress =
@@ -767,13 +743,14 @@ function makeMedia({
         currentEpisode: episode
     };
 
+    // 已修改：符合 CapyPlayer 指南规范字段名
     if (tmdbShow?.poster_path) {
-        media.posterPath =
+        media.posterUrl =
             TMDB_POSTER + tmdbShow.poster_path;
     }
 
     if (tmdbShow?.backdrop_path) {
-        media.backdropPath =
+        media.backdropUrl =
             TMDB_BACKDROP + tmdbShow.backdrop_path;
     }
 
@@ -846,10 +823,6 @@ async function buildContinueItem(item, stats) {
     const tmdbId =
         toNumber(show?.ids?.tmdb) || null;
 
-    /*
-     * 当前 MediaItem 使用 TMDB 类型。
-     * 没有 TMDB ID 时不生成伪 tmdb 条目。
-     */
     if (!tmdbId || !stats?.last) {
         return null;
     }
@@ -964,9 +937,6 @@ async function attachEpisodeIds(data) {
                 String(episodeId);
         }
     } catch (error) {
-        /*
-         * ID 同步失败不影响继续观看条目本身。
-         */
         console.warn(
             "TMDB 季/集 ID 获取失败:",
             error?.message || error
@@ -1007,10 +977,6 @@ async function loadContinueWatching(params = {}) {
             return [];
         }
 
-        /*
-         * 先按 show 最近观看时间排序，
-         * 再进行下一集推断。
-         */
         watched.sort(
             (a, b) =>
                 safeTime(b?.last_watched_at) -
@@ -1054,10 +1020,6 @@ async function loadContinueWatching(params = {}) {
                 }
             );
 
-        /*
-         * 保持最近观看顺序。
-         * 不再增加“最近播出”这一层排序。
-         */
         const available =
             checked
                 .filter(Boolean)
