@@ -2,10 +2,7 @@
  * CapyPlayer Widget - Trakt 官方 Continue Watching
  * v2.0.0
  *
- * 严格遵照 CapyPlayer 组件开发指南编写：
- * 1. 使用全局 var WidgetMetadata
- * 2. 显式区分 type ("tmdb") 与 mediaType ("tv")
- * 3. 严格返回 MediaItem[] 数组
+ * 严格遵照 CapyPlayer 组件开发指南与 ES5/ES6 沙箱语法规范编写
  */
 
 var WidgetMetadata = {
@@ -59,8 +56,7 @@ var WidgetMetadata = {
 /* ==================== 常量 ==================== */
 
 var TRAKT_BASE = "https://api.trakt.tv";
-var TRAKT_CLIENT_ID =
-    "95b59922670c84040db3632c7aac6f33704f6ffe5cbf3113a056e37cb45cb482";
+var TRAKT_CLIENT_ID = "95b59922670c84040db3632c7aac6f33704f6ffe5cbf3113a056e37cb45cb482";
 
 var TMDB_POSTER = "https://image.tmdb.org/t/p/w500";
 var TMDB_BACKDROP = "https://image.tmdb.org/t/p/w780";
@@ -73,7 +69,6 @@ var MAX_PAGE_SIZE = 50;
 
 var tmdbShowCache = new Map();
 var tmdbSeasonCache = new Map();
-var pendingMap = new Map();
 
 /* ==================== 基础工具 ==================== */
 
@@ -87,15 +82,12 @@ function toNumber(value) {
 }
 
 function pad2(value) {
-    return String(toNumber(value)).padStart(2, "0");
+    var s = String(toNumber(value));
+    return s.length < 2 ? "0" + s : s;
 }
 
 function formatSE(season, episode) {
     return "S" + pad2(season) + "E" + pad2(episode);
-}
-
-function getUser(params) {
-    return String(params && params.traktUser || "").trim();
 }
 
 function getAccessToken(params) {
@@ -122,7 +114,7 @@ function getTraktHeaders(accessToken) {
     };
 
     if (accessToken) {
-        headers.Authorization = "Bearer " + accessToken;
+        headers["Authorization"] = "Bearer " + accessToken;
     }
 
     return headers;
@@ -144,22 +136,15 @@ async function traktRequest(path, accessToken, strict) {
             if (!response) {
                 lastError = new Error("Trakt 返回为空");
             } else if (response.ok === false) {
-                lastError = new Error(
-                    "Trakt HTTP " + (response.status || "unknown")
-                );
+                lastError = new Error("Trakt HTTP " + (response.status || "unknown"));
             } else {
-                var data = response.data !== undefined
-                    ? response.data
-                    : response;
-
+                var data = response.data !== undefined ? response.data : response;
                 if (typeof data !== "string") {
                     return data;
                 }
-
                 if (!data.trim()) {
                     return null;
                 }
-
                 try {
                     return JSON.parse(data);
                 } catch (error) {
@@ -184,91 +169,56 @@ async function traktRequest(path, accessToken, strict) {
     return null;
 }
 
-/* ==================== TMDB ==================== */
-
-function cachedLoad(cache, key, loader, ttlMs) {
-    var now = Date.now();
-    var mem = cache.get(key);
-
-    if (mem && (!ttlMs || now - mem.t < ttlMs)) {
-        return Promise.resolve(mem.v);
-    }
-
-    if (pendingMap.has(key)) {
-        return pendingMap.get(key);
-    }
-
-    var task = (async function() {
-        var value = await loader();
-        cache.set(key, {
-            v: value,
-            t: Date.now()
-        });
-        return value;
-    })();
-
-    pendingMap.set(key, task);
-
-    return task.finally(function() {
-        pendingMap.delete(key);
-    });
-}
+/* ==================== TMDB 请求 ==================== */
 
 async function fetchTmdbShow(tmdbId) {
     if (!tmdbId) return null;
+    var cacheKey = "tmdb:show:" + tmdbId;
+    if (tmdbShowCache.has(cacheKey)) {
+        return tmdbShowCache.get(cacheKey);
+    }
 
-    return cachedLoad(
-        tmdbShowCache,
-        "tmdb:show:" + tmdbId,
-        async function() {
-            var data = await Widget.tmdb.get(
-                "/tv/" + encodeURIComponent(tmdbId),
-                {
-                    params: {
-                        language: "zh-CN"
-                    },
-                    timeout: TIMEOUT_TMDB
-                }
-            );
-
-            if (!data || typeof data !== "object") {
-                throw new Error("TMDB 剧集详情为空");
+    try {
+        var data = await Widget.tmdb.get(
+            "/tv/" + encodeURIComponent(tmdbId),
+            {
+                params: { language: "zh-CN" },
+                timeout: TIMEOUT_TMDB
             }
-
+        );
+        if (data && typeof data === "object") {
+            tmdbShowCache.set(cacheKey, data);
             return data;
-        },
-        24 * 3600 * 1000
-    );
+        }
+    } catch (e) {
+        console.error("fetchTmdbShow 失败:", e);
+    }
+    return null;
 }
 
 async function fetchTmdbSeason(tmdbId, season) {
     if (!tmdbId || season <= 0) return null;
+    var cacheKey = "tmdb:season:" + tmdbId + ":" + season;
+    if (tmdbSeasonCache.has(cacheKey)) {
+        return tmdbSeasonCache.get(cacheKey);
+    }
 
-    return cachedLoad(
-        tmdbSeasonCache,
-        "tmdb:season:" + tmdbId + ":" + season,
-        async function() {
-            var data = await Widget.tmdb.get(
-                "/tv/" +
-                encodeURIComponent(tmdbId) +
-                "/season/" +
-                encodeURIComponent(season),
-                {
-                    params: {
-                        language: "zh-CN"
-                    },
-                    timeout: TIMEOUT_TMDB
-                }
-            );
-
-            if (!data || typeof data !== "object") {
-                throw new Error("TMDB 季详情为空");
+    try {
+        var data = await Widget.tmdb.get(
+            "/tv/" + encodeURIComponent(tmdbId) + "/season/" + encodeURIComponent(season),
+            {
+                params: { language: "zh-CN" },
+                timeout: TIMEOUT_TMDB
             }
-
+        );
+        if (data && typeof data === "object") {
+            tmdbSeasonCache.set(cacheKey, data);
             return data;
-        },
-        6 * 3600 * 1000
-    );
+        }
+    } catch (e) {
+        console.error("fetchTmdbSeason 失败:", e);
+    }
+    return null;
 }
 
 /* ==================== 官方 Continue Watching ==================== */
@@ -281,11 +231,10 @@ async function fetchOfficialContinueWatching(accessToken, page, pageSize) {
         "&extended=full";
 
     var data = await traktRequest(path, accessToken, true);
-
     return toArray(data);
 }
 
-/* ==================== 官方条目解析 ==================== */
+/* ==================== 条目解析 ==================== */
 
 function getShowFromUpNext(item) {
     if (item && item.show) return item.show;
@@ -295,17 +244,8 @@ function getShowFromUpNext(item) {
 
 function getEpisodeFromUpNext(item) {
     if (item && item.episode) return item.episode;
-
-    if (
-        item &&
-        item.progress &&
-        item.progress.next_episode
-    ) {
-        return item.progress.next_episode;
-    }
-
+    if (item && item.progress && item.progress.next_episode) return item.progress.next_episode;
     if (item && item.next_episode) return item.next_episode;
-
     return {};
 }
 
@@ -315,43 +255,19 @@ function getProgressFromUpNext(item) {
 }
 
 function getTraktShowId(show) {
-    return (
-        show &&
-        show.ids &&
-        (
-            show.ids.trakt ||
-            show.ids.tmdb ||
-            show.ids.slug
-        )
-    ) || "";
+    return (show && show.ids && (show.ids.trakt || show.ids.tmdb || show.ids.slug)) || "";
 }
 
 function getTmdbId(show) {
-    return toNumber(
-        show &&
-        show.ids &&
-        show.ids.tmdb
-    );
+    return toNumber(show && show.ids && show.ids.tmdb);
 }
 
 function getEpisodeSeason(episode) {
-    return toNumber(
-        episode &&
-        (
-            episode.season ||
-            episode.season_number
-        )
-    );
+    return toNumber(episode && (episode.season || episode.season_number));
 }
 
 function getEpisodeNumber(episode) {
-    return toNumber(
-        episode &&
-        (
-            episode.number ||
-            episode.episode_number
-        )
-    );
+    return toNumber(episode && (episode.number || episode.episode_number));
 }
 
 /* ==================== MediaItem 构建 ==================== */
@@ -369,40 +285,18 @@ function buildMediaItem(item, tmdbShow, tmdbSeason) {
         return null;
     }
 
-    var title =
-        (tmdbShow && (
-            tmdbShow.name ||
-            tmdbShow.original_name
-        )) ||
-        show.title ||
-        "未知剧集";
-
-    var year =
-        show.year ||
-        String(
-            tmdbShow && tmdbShow.first_air_date || ""
-        ).slice(0, 4);
+    var title = (tmdbShow && (tmdbShow.name || tmdbShow.original_name)) || show.title || "未知剧集";
+    var year = show.year || String(tmdbShow && tmdbShow.first_air_date || "").slice(0, 4);
 
     var media = {
-        id: "trakt-up-next." + (
-            getTraktShowId(show) ||
-            tmdbId ||
-            title
-        ),
-        type: "tmdb",          // 严格显式指定条目类型为 tmdb
-        mediaType: "tv",       // 媒体内容类型为剧集
+        id: "trakt-up-next." + (getTraktShowId(show) || tmdbId || title),
+        type: "tmdb",
+        mediaType: "tv",
         title: title,
         year: String(year || ""),
         currentSeason: season,
         currentEpisode: episodeNumber,
-        description:
-            "▶️ " +
-            formatSE(season, episodeNumber) +
-            (
-                episode.title
-                    ? " · " + episode.title
-                    : ""
-            )
+        description: "▶️ " + formatSE(season, episodeNumber) + (episode.title ? " · " + episode.title : "")
     };
 
     if (tmdbId) {
@@ -412,12 +306,9 @@ function buildMediaItem(item, tmdbShow, tmdbSeason) {
     if (episode.ids && episode.ids.tmdb) {
         media.currentEpisodeId = String(episode.ids.tmdb);
     } else if (tmdbSeason && tmdbSeason.episodes) {
-        var tmdbEpisode = toArray(tmdbSeason.episodes).find(
-            function(ep) {
-                return toNumber(ep.episode_number) === episodeNumber;
-            }
-        );
-
+        var tmdbEpisode = toArray(tmdbSeason.episodes).find(function(ep) {
+            return toNumber(ep.episode_number) === episodeNumber;
+        });
         if (tmdbEpisode && tmdbEpisode.id) {
             media.currentEpisodeId = String(tmdbEpisode.id);
         }
@@ -453,53 +344,10 @@ function buildMediaItem(item, tmdbShow, tmdbSeason) {
 
     if (aired > 0 && completed >= 0) {
         var percent = Math.min(100, Math.max(0, completed / aired * 100));
-        media.description +=
-            " · 进度 " +
-            Math.round(percent * 10) / 10 +
-            "%（" +
-            completed +
-            "/" +
-            aired +
-            "）";
+        media.description += " · 进度 " + (Math.round(percent * 10) / 10) + "%（" + completed + "/" + aired + "）";
     }
 
     return media;
-}
-
-/* ==================== 并发工具 ==================== */
-
-async function mapWithConcurrency(items, concurrency, worker) {
-    var list = toArray(items);
-
-    if (!list.length) {
-        return [];
-    }
-
-    var results = new Array(list.length);
-    var cursor = 0;
-    var count = Math.min(
-        Math.max(1, concurrency || 1),
-        list.length
-    );
-
-    await Promise.all(
-        Array.from(
-            { length: count },
-            async function() {
-                while (cursor < list.length) {
-                    var index = cursor++;
-                    try {
-                        results[index] = await worker(list[index], index);
-                    } catch (error) {
-                        console.error("处理 Trakt 条目失败:", error);
-                        results[index] = null;
-                    }
-                }
-            }
-        )
-    );
-
-    return results;
 }
 
 /* ==================== 主函数 ==================== */
@@ -526,40 +374,33 @@ async function loadContinueWatching(params) {
             return [];
         }
 
-        var result = await mapWithConcurrency(
-            officialItems,
-            5,
-            async function(item) {
-                var show = getShowFromUpNext(item);
-                var tmdbId = getTmdbId(show);
+        var results = [];
+        for (var i = 0; i < officialItems.length; i++) {
+            var item = officialItems[i];
+            var show = getShowFromUpNext(item);
+            var tmdbId = getTmdbId(show);
 
-                var tmdbShow = null;
-                var tmdbSeason = null;
+            var tmdbShow = null;
+            var tmdbSeason = null;
 
-                if (tmdbId) {
-                    try {
-                        tmdbShow = await fetchTmdbShow(tmdbId);
-                    } catch (error) {
-                        console.error("TMDB 剧集信息读取失败:", error);
-                    }
-                }
-
-                var episode = getEpisodeFromUpNext(item);
-                var season = getEpisodeSeason(episode);
-
-                if (tmdbId && season > 0) {
-                    try {
-                        tmdbSeason = await fetchTmdbSeason(tmdbId, season);
-                    } catch (error) {
-                        console.error("TMDB 季信息读取失败:", error);
-                    }
-                }
-
-                return buildMediaItem(item, tmdbShow, tmdbSeason);
+            if (tmdbId) {
+                tmdbShow = await fetchTmdbShow(tmdbId);
             }
-        );
 
-        return result.filter(Boolean);
+            var episode = getEpisodeFromUpNext(item);
+            var season = getEpisodeSeason(episode);
+
+            if (tmdbId && season > 0) {
+                tmdbSeason = await fetchTmdbSeason(tmdbId, season);
+            }
+
+            var parsedMedia = buildMediaItem(item, tmdbShow, tmdbSeason);
+            if (parsedMedia) {
+                results.push(parsedMedia);
+            }
+        }
+
+        return results;
     } catch (error) {
         console.error("Trakt 官方 Continue Watching 加载失败:", error);
         return [];
