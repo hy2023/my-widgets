@@ -1,16 +1,12 @@
 /*
- * CapyPlayer Widget - Trakt片单
- * v2.0.1
+ * CapyPlayer Widget - Trakt片单 (Progress核心 + History辅助)
+ * v2.1.0
  *
  * 核心逻辑：
- *   1. 读取 Trakt watched/shows?extended=progress
- *   2. 从 watched progress 找到每部剧最高已观看 S/E
- *   3. 用 item.last_watched_at 作为该剧最近观看时间
- *   4. 自动推断下一集：Trakt 当前季 → Trakt next_episode → TMDB 当前季 → TMDB 下一季
- *   5. 生成 CapyPlayer MediaItem
- *
- * 说明：
- *   recentDays 仍用于筛选最近观看的剧；
+ *   1. 【核心】读取 Trakt watched/shows?extended=progress 获得所有剧集的最高已看 S/E 及 last_watched_at。
+ *   2. 【辅助】当 Progress 数据缺失 last_watched_at 时，辅助调用 Trakt History 补充时间。
+ *   3. 自动推断下一集：Trakt 当前季 → Trakt next_episode → TMDB 当前季 → TMDB 下一季。
+ *   4. 符合 CapyPlayer 最新开发指南规范 (type/posterUrl/backdropUrl)。
  */
 
 var WidgetMetadata = {
@@ -18,7 +14,7 @@ var WidgetMetadata = {
     title: "Trakt片单",
     author: "Holyn",
     description: "同步 Trakt 观看进度，自动推断下一集并生成继续观看列表。",
-    version: "2.0.1",
+    version: "2.1.0",
     requiredVersion: "0.0.4",
 
     globalParams: [
@@ -86,6 +82,7 @@ const TTL_TMDB_SHOW = 24 * 3600 * 1000;
 const TTL_TMDB_SEASON = 6 * 3600 * 1000;
 const TTL_TRAKT_SEASON = 6 * 3600 * 1000;
 const TTL_TRAKT_NEXT = 1 * 3600 * 1000;
+const TTL_TRAKT_HISTORY = 1 * 3600 * 1000;
 
 /* ==================== 工具 ==================== */
 
@@ -134,12 +131,13 @@ function getRecentDays(params) {
 
 /* ==================== 缓存 ==================== */
 
-const CACHE_PREFIX = "traktList.v2:";
+const CACHE_PREFIX = "traktList.v2.1:";
 
 const tmdbShowCache = new Map();
 const tmdbSeasonCache = new Map();
 const traktSeasonCache = new Map();
 const traktNextCache = new Map();
+const traktHistoryCache = new Map();
 
 const pendingMap = new Map();
 
@@ -253,7 +251,7 @@ function hasAired(value) {
     return !!day && day <= today();
 }
 
-/* ==================== Trakt ==================== */
+/* ==================== Trakt API ==================== */
 
 const getTraktShowId = show =>
     show?.ids?.trakt || show?.ids?.slug || "";
@@ -306,11 +304,6 @@ async function traktRequest(path, strict = false) {
         }
 
         if (attempt < MAX_RETRY) {
-            console.warn(
-                `Trakt 请求失败，${RETRY_DELAY_MS}ms 后重试 ` +
-                `(${attempt + 1}/${MAX_RETRY})：${path}`
-            );
-
             await new Promise(resolve =>
                 setTimeout(resolve, RETRY_DELAY_MS)
             );
@@ -333,38 +326,56 @@ async function fetchAllTraktPages(pathBuilder) {
             page === 1
         );
 
-        if (data == null) {
-            if (page > 1) {
-                console.warn(`Trakt 第 ${page} 页为空，提前结束`);
-            }
-            break;
-        }
+        if (data == null) break;
 
         const rows = toArray(data);
         if (!rows.length) break;
 
         all.push(...rows);
 
-        if (rows.length < TRAKT_PAGE_LIMIT) {
-            break;
-        }
+        if (rows.length < TRAKT_PAGE_LIMIT) break;
     }
 
     return all;
 }
 
-/*
- * 核心数据源：
- * 一次读取 watched/shows + progress。
- *
- * watched progress 已用于计算最高已观看集；
- * item.last_watched_at 用于该剧的最近观看时间和排序。
- */
+/* 核心数据源：Progress */
 const fetchWatchedShows = user =>
     fetchAllTraktPages(page =>
         `/users/${encodeURIComponent(user)}/watched/shows` +
         `?extended=progress&page=${page}&limit=${TRAKT_PAGE_LIMIT}`
     );
+
+/* 辅助数据源：History (懒加载，仅在 Progress 缺少时间时兜底触发) */
+async function fetchHistoryLastWatched(user, show) {
+    const showId = getTraktShowId(show);
+    if (!user || !showId) return null;
+
+    const cacheKey = `trakt:history:${user}:${showId}`;
+
+    return await cachedLoad(
+        traktHistoryCache,
+        cacheKey,
+        async () => {
+            const rows = await traktRequest(
+                `/users/${encodeURIComponent(user)}/history/shows/${encodeURIComponent(showId)}?page=1&limit=10`
+            );
+
+            const list = toArray(rows);
+            if (!list.length) return null;
+
+            let latestTime = null;
+            for (const row of list) {
+                const watchedAt = row?.watched_at || row?.created_at;
+                if (safeTime(watchedAt) > safeTime(latestTime)) {
+                    latestTime = watchedAt;
+                }
+            }
+            return latestTime;
+        },
+        TTL_TRAKT_HISTORY
+    );
+}
 
 async function fetchTraktSeason(show, season) {
     const id = getTraktShowId(show);
@@ -505,10 +516,7 @@ async function fetchTmdbSeason(id, season) {
 
 async function loadTmdbShow(tmdbId) {
     if (!tmdbId) {
-        return {
-            tmdbShow: null,
-            failed: false
-        };
+        return { tmdbShow: null, failed: false };
     }
 
     try {
@@ -517,15 +525,11 @@ async function loadTmdbShow(tmdbId) {
             failed: false
         };
     } catch (error) {
-        console.warn("TMDB 剧集详情读取失败:", error?.message || error);
-        return {
-            tmdbShow: null,
-            failed: true
-        };
+        return { tmdbShow: null, failed: true };
     }
 }
 
-/* ==================== 观看进度 ==================== */
+/* ==================== 观看进度 (Progress 核心) ==================== */
 
 function getWatchStats(item) {
     let count = 0;
@@ -593,9 +597,7 @@ async function inferNextEpisode(
 
     const targetEpisode = last.episode + 1;
 
-    /*
-     * 1. Trakt 当前季
-     */
+    // 1. Trakt 当前季
     const currentSeason = await fetchTraktSeason(
         show,
         last.season
@@ -612,9 +614,7 @@ async function inferNextEpisode(
             : { status: "none" };
     }
 
-    /*
-     * 2. Trakt next_episode
-     */
+    // 2. Trakt next_episode
     const traktNext = await fetchTraktNext(show);
 
     if (traktNext) {
@@ -632,9 +632,7 @@ async function inferNextEpisode(
         return { status: "lookup_failed" };
     }
 
-    /*
-     * 3. TMDB 当前季
-     */
+    // 3. TMDB 当前季
     try {
         const seasonData = await fetchTmdbSeason(
             tmdbId,
@@ -652,9 +650,7 @@ async function inferNextEpisode(
                 : { status: "none" };
         }
 
-        /*
-         * 4. TMDB 下一季
-         */
+        // 4. TMDB 下一季
         const nextSeason = last.season + 1;
 
         const hasNextSeason = toArray(tmdbShow?.seasons).some(
@@ -691,7 +687,7 @@ async function inferNextEpisode(
     }
 }
 
-/* ==================== MediaItem ==================== */
+/* ==================== MediaItem 构建 ==================== */
 
 function makeShowMeta(show, tmdbShow) {
     return {
@@ -743,15 +739,12 @@ function makeMedia({
         currentEpisode: episode
     };
 
-    // 已修改：符合 CapyPlayer 指南规范字段名
     if (tmdbShow?.poster_path) {
-        media.posterUrl =
-            TMDB_POSTER + tmdbShow.poster_path;
+        media.posterUrl = TMDB_POSTER + tmdbShow.poster_path;
     }
 
     if (tmdbShow?.backdrop_path) {
-        media.backdropUrl =
-            TMDB_BACKDROP + tmdbShow.backdrop_path;
+        media.backdropUrl = TMDB_BACKDROP + tmdbShow.backdrop_path;
     }
 
     return media;
@@ -759,11 +752,7 @@ function makeMedia({
 
 /* ==================== 并发 ==================== */
 
-async function mapWithConcurrency(
-    items,
-    concurrency,
-    worker
-) {
+async function mapWithConcurrency(items, concurrency, worker) {
     const list = toArray(items);
     if (!list.length) return [];
 
@@ -776,61 +765,40 @@ async function mapWithConcurrency(
     );
 
     await Promise.all(
-        Array.from(
-            { length: workerCount },
-            async () => {
-                while (cursor < list.length) {
-                    const index = cursor++;
-
-                    try {
-                        results[index] =
-                            await worker(list[index], index);
-                    } catch {
-                        results[index] = null;
-                    }
+        Array.from({ length: workerCount }, async () => {
+            while (cursor < list.length) {
+                const index = cursor++;
+                try {
+                    results[index] = await worker(list[index], index);
+                } catch {
+                    results[index] = null;
                 }
             }
-        )
+        })
     );
 
     return results;
 }
 
-/* ==================== 最近观看筛选 ==================== */
+/* ==================== 构建条目 (含 History 兜底逻辑) ==================== */
 
-function isRecentContinueItem(
-    item,
-    days = HIDE_AFTER_DAYS
-) {
-    const watchedAt =
-        safeTime(item?.last_watched_at);
-
-    if (watchedAt <= 0) return false;
-
-    if (!days || days <= 0) return true;
-
-    return (
-        Date.now() - watchedAt <=
-        days * 86400000
-    );
-}
-
-/* ==================== 构建继续观看条目 ==================== */
-
-async function buildContinueItem(item, stats) {
+async function buildContinueItem(user, item, stats) {
     const show = item?.show || {};
-
-    const tmdbId =
-        toNumber(show?.ids?.tmdb) || null;
+    const tmdbId = toNumber(show?.ids?.tmdb) || null;
 
     if (!tmdbId || !stats?.last) {
         return null;
     }
 
-    const {
-        tmdbShow,
-        failed: tmdbFailed
-    } = await loadTmdbShow(tmdbId);
+    // 核心时间取自 Progress 的 item.last_watched_at
+    let lastWatchedAt = stats.lastWatchedAt;
+
+    // 【 History 辅助兜底】：若 Progress 接口缺失 last_watched_at，才从 History 补充获取
+    if (!lastWatchedAt) {
+        lastWatchedAt = await fetchHistoryLastWatched(user, show);
+    }
+
+    const { tmdbShow, failed: tmdbFailed } = await loadTmdbShow(tmdbId);
 
     const result = await inferNextEpisode(
         stats.last,
@@ -844,34 +812,27 @@ async function buildContinueItem(item, stats) {
         return null;
     }
 
-    const season =
-        toNumber(result.next?.season);
-
-    const episode =
-        toNumber(result.next?.episode);
+    const season = toNumber(result.next?.season);
+    const episode = toNumber(result.next?.episode);
 
     if (season <= 0 || episode <= 0) {
         return null;
     }
 
-    const meta =
-        makeShowMeta(show, tmdbShow);
+    const meta = makeShowMeta(show, tmdbShow);
+    const aired = getAiredCount(show, tmdbShow);
 
-    const aired =
-        getAiredCount(show, tmdbShow);
-
-    const media =
-        makeMedia({
-            show,
-            tmdbId,
-            tmdbShow,
-            title: meta.title,
-            year: meta.year,
-            season,
-            episode,
-            count: stats.count,
-            aired
-        });
+    const media = makeMedia({
+        show,
+        tmdbId,
+        tmdbShow,
+        title: meta.title,
+        year: meta.year,
+        season,
+        episode,
+        count: stats.count,
+        aired
+    });
 
     if (!media) return null;
 
@@ -882,65 +843,41 @@ async function buildContinueItem(item, stats) {
         tmdbId,
         season,
         episode,
-        lastWatchedAt:
-            stats.lastWatchedAt
+        lastWatchedAt
     };
 }
 
-/* ==================== TMDB 播放定位 ==================== */
+/* ==================== TMDB 播放定位补全 ==================== */
 
 async function attachEpisodeIds(data) {
     const media = data?.media;
     const tmdbId = data?.tmdbId;
 
-    if (!media || !tmdbId) {
-        return media || null;
-    }
+    if (!media || !tmdbId) return media || null;
 
-    const season =
-        toNumber(media.currentSeason);
+    const season = toNumber(media.currentSeason);
+    const episode = toNumber(media.currentEpisode);
 
-    const episode =
-        toNumber(media.currentEpisode);
-
-    if (season <= 0 || episode <= 0) {
-        return media;
-    }
+    if (season <= 0 || episode <= 0) return media;
 
     try {
-        const seasonData =
-            await fetchTmdbSeason(
-                tmdbId,
-                season
-            );
-
-        const seasonId =
-            toNumber(seasonData?.id);
+        const seasonData = await fetchTmdbSeason(tmdbId, season);
+        const seasonId = toNumber(seasonData?.id);
 
         if (seasonId > 0) {
-            media.currentSeasonId =
-                String(seasonId);
+            media.currentSeasonId = String(seasonId);
         }
 
-        const targetEpisode =
-            toArray(seasonData?.episodes).find(
-                item =>
-                    toNumber(item?.episode_number) ===
-                    episode
-            );
+        const targetEpisode = toArray(seasonData?.episodes).find(
+            item => toNumber(item?.episode_number) === episode
+        );
 
-        const episodeId =
-            toNumber(targetEpisode?.id);
-
+        const episodeId = toNumber(targetEpisode?.id);
         if (episodeId > 0) {
-            media.currentEpisodeId =
-                String(episodeId);
+            media.currentEpisodeId = String(episodeId);
         }
     } catch (error) {
-        console.warn(
-            "TMDB 季/集 ID 获取失败:",
-            error?.message || error
-        );
+        console.warn("TMDB ID 补全失败:", error?.message || error);
     }
 
     return media;
@@ -950,120 +887,77 @@ async function attachEpisodeIds(data) {
 
 async function loadContinueWatching(params = {}) {
     const user = getUser(params);
-
-    const {
-        page,
-        pageSize
-    } = getPaging(params);
-
-    const recentDays =
-        getRecentDays(params);
+    const { page, pageSize } = getPaging(params);
+    const recentDays = getRecentDays(params);
 
     if (!user) {
-        console.error(
-            "Trakt片单：未设置 Trakt 用户名"
-        );
+        console.error("Trakt片单：未设置 Trakt 用户名");
         return [];
     }
 
     try {
-        const watched =
-            await fetchWatchedShows(user);
+        // 1. 【核心数据源】一次获取 Progress 进度的所有数据
+        const watched = await fetchWatchedShows(user);
 
         if (!watched.length) {
-            console.warn(
-                "Trakt片单：没有读取到观看记录"
-            );
+            console.warn("Trakt片单：没有读取到观看记录");
             return [];
         }
 
-        watched.sort(
-            (a, b) =>
-                safeTime(b?.last_watched_at) -
-                safeTime(a?.last_watched_at)
+        // 2. 根据 Progress 计算已观看数与最高 S/E
+        const candidates = watched
+            .map(item => ({
+                item,
+                stats: getWatchStats(item)
+            }))
+            .filter(({ item, stats }) => {
+                if (stats.count <= 0 || !stats.last) return false;
+                
+                // 筛选范围控制
+                const watchTime = safeTime(item?.last_watched_at);
+                if (recentDays > 0 && watchTime > 0) {
+                    return (Date.now() - watchTime) <= recentDays * 86400000;
+                }
+                return true;
+            });
+
+        // 3. 构建继续观看条目（如缺少时间会触发 History 辅助补全）
+        const checked = await mapWithConcurrency(
+            candidates,
+            MAX_CONCURRENCY,
+            async ({ item, stats }) => {
+                try {
+                    return await buildContinueItem(user, item, stats);
+                } catch (error) {
+                    return null;
+                }
+            }
         );
 
-        const candidates =
-            watched
-                .map(item => ({
-                    item,
-                    stats:
-                        getWatchStats(item)
-                }))
-                .filter(
-                    ({ item, stats }) =>
-                        stats.count > 0 &&
-                        !!stats.last &&
-                        isRecentContinueItem(
-                            item,
-                            recentDays
-                        )
-                );
+        // 4. 按最近观看时间倒序排序
+        const available = checked
+            .filter(Boolean)
+            .sort((a, b) => safeTime(b.lastWatchedAt) - safeTime(a.lastWatchedAt));
 
-        const checked =
-            await mapWithConcurrency(
-                candidates,
-                MAX_CONCURRENCY,
-                async ({ item, stats }) => {
-                    try {
-                        return await buildContinueItem(
-                            item,
-                            stats
-                        );
-                    } catch (error) {
-                        console.warn(
-                            "继续观看条目处理失败:",
-                            error?.message || error
-                        );
-                        return null;
-                    }
-                }
-            );
+        const start = (page - 1) * pageSize;
+        const pageItems = available.slice(start, start + pageSize);
 
-        const available =
-            checked
-                .filter(Boolean)
-                .sort(
-                    (a, b) =>
-                        safeTime(
-                            b.lastWatchedAt
-                        ) -
-                        safeTime(
-                            a.lastWatchedAt
-                        )
-                );
+        if (!pageItems.length) return [];
 
-        const start =
-            (page - 1) * pageSize;
-
-        const pageItems =
-            available.slice(
-                start,
-                start + pageSize
-            );
-
-        if (!pageItems.length) {
-            return [];
-        }
-
+        // 5. 补充精准播放页面的 TMDB 季/集 ID
         return await mapWithConcurrency(
             pageItems,
             MAX_CONCURRENCY,
             async data => {
                 try {
-                    return await attachEpisodeIds(
-                        data
-                    );
+                    return await attachEpisodeIds(data);
                 } catch {
                     return data?.media || null;
                 }
             }
         );
     } catch (error) {
-        console.error(
-            "Trakt片单加载失败:",
-            error?.message || error
-        );
+        console.error("Trakt片单加载失败:", error?.message || error);
         return [];
     }
 }
