@@ -1,31 +1,11 @@
-from pathlib import Path
-import textwrap
-
-code = r'''/*
+/*
  * CapyPlayer Widget - Trakt 官方 Continue Watching
  * v2.0.0
  *
- * 核心逻辑：
- *   Trakt /sync/progress/up_next
- *       ↓
- *   Trakt 官方计算的“下一集”
- *       ↓
- *   TMDB 补充海报 / 背景 / 季集 ID
- *       ↓
- *   输出 CapyPlayer MediaItem[]
- *
- * 重要：
- *   本版本不再使用：
- *     - /users/{user}/watched/shows
- *     - /users/{user}/history/shows
- *     - 本地最高观看集数推断
- *     - /shows/{id}/next_episode 作为继续观看判定
- *     - 自定义 recentDays 过滤
- *
- *   继续观看的候选与下一集判定完全交给 Trakt：
- *     GET /sync/progress/up_next
- *
- *   该接口属于用户同步/进度接口，需要 Trakt OAuth Access Token。
+ * 严格遵照 CapyPlayer 组件开发指南编写：
+ * 1. 使用全局 var WidgetMetadata
+ * 2. 显式区分 type ("tmdb") 与 mediaType ("tv")
+ * 3. 严格返回 MediaItem[] 数组
  */
 
 var WidgetMetadata = {
@@ -34,29 +14,31 @@ var WidgetMetadata = {
     author: "Holyn",
     description: "使用 Trakt 官方 Continue Watching / Up Next 数据生成继续观看列表。",
     version: "2.0.0",
-    requiredVersion: "0.0.4",
 
     globalParams: [
         {
             name: "traktUser",
             title: "Trakt 用户名（仅显示/兼容）",
             type: "string",
-            value: ""
+            defaultValue: ""
         },
         {
             name: "traktAccessToken",
             title: "Trakt Access Token",
             type: "string",
-            value: ""
+            defaultValue: ""
         }
     ],
 
     modules: [
         {
+            id: "continue_watching",
             title: "继续观看",
             functionName: "loadContinueWatching",
             type: "media_list",
             cacheDuration: 300,
+            timeoutSeconds: 25,
+            retryCount: 2,
             params: [
                 {
                     name: "page",
@@ -64,16 +46,10 @@ var WidgetMetadata = {
                     type: "page"
                 },
                 {
-                    name: "pageSize",
+                    name: "count",
                     title: "每页数量",
-                    type: "enum",
-                    value: "15",
-                    enumOptions: [
-                        { title: "10", value: "10" },
-                        { title: "15", value: "15" },
-                        { title: "20", value: "20" },
-                        { title: "30", value: "30" }
-                    ]
+                    type: "count",
+                    defaultValue: "15"
                 }
             ]
         }
@@ -110,11 +86,6 @@ function toNumber(value) {
     return Number.isFinite(n) ? n : 0;
 }
 
-function safeTime(value) {
-    var time = new Date(value || 0).getTime();
-    return Number.isNaN(time) ? 0 : time;
-}
-
 function pad2(value) {
     return String(toNumber(value)).padStart(2, "0");
 }
@@ -133,11 +104,11 @@ function getAccessToken(params) {
 
 function getPaging(params) {
     var rawPage = parseInt(params && params.page || 1, 10) || 1;
-    var rawSize = parseInt(params && params.pageSize || 15, 10) || 15;
+    var rawCount = parseInt(params && (params.count || params.pageSize) || 15, 10) || 15;
 
     return {
         page: Math.max(1, rawPage),
-        pageSize: Math.min(MAX_PAGE_SIZE, Math.max(1, rawSize))
+        pageSize: Math.min(MAX_PAGE_SIZE, Math.max(1, rawCount))
     };
 }
 
@@ -302,16 +273,6 @@ async function fetchTmdbSeason(tmdbId, season) {
 
 /* ==================== 官方 Continue Watching ==================== */
 
-/*
- * Trakt 官方接口：
- *
- * GET /sync/progress/up_next
- *
- * 该接口直接返回用户应该继续观看的剧集/下一集，
- * 不再由本组件根据 watched/history 自行推算。
- *
- * page / limit / sort_by / sort_how 均交给 Trakt。
- */
 async function fetchOfficialContinueWatching(accessToken, page, pageSize) {
     var path =
         "/sync/progress/up_next" +
@@ -335,10 +296,6 @@ function getShowFromUpNext(item) {
 function getEpisodeFromUpNext(item) {
     if (item && item.episode) return item.episode;
 
-    /*
-     * 兼容部分 API 返回结构：
-     * progress.next_episode
-     */
     if (
         item &&
         item.progress &&
@@ -397,7 +354,7 @@ function getEpisodeNumber(episode) {
     );
 }
 
-/* ==================== MediaItem ==================== */
+/* ==================== MediaItem 构建 ==================== */
 
 function buildMediaItem(item, tmdbShow, tmdbSeason) {
     var show = getShowFromUpNext(item);
@@ -432,7 +389,8 @@ function buildMediaItem(item, tmdbShow, tmdbSeason) {
             tmdbId ||
             title
         ),
-        mediaType: "tv",
+        type: "tmdb",          // 严格显式指定条目类型为 tmdb
+        mediaType: "tv",       // 媒体内容类型为剧集
         title: title,
         year: String(year || ""),
         currentSeason: season,
@@ -452,9 +410,7 @@ function buildMediaItem(item, tmdbShow, tmdbSeason) {
     }
 
     if (episode.ids && episode.ids.tmdb) {
-        media.currentEpisodeId = String(
-            episode.ids.tmdb
-        );
+        media.currentEpisodeId = String(episode.ids.tmdb);
     } else if (tmdbSeason && tmdbSeason.episodes) {
         var tmdbEpisode = toArray(tmdbSeason.episodes).find(
             function(ep) {
@@ -463,39 +419,28 @@ function buildMediaItem(item, tmdbShow, tmdbSeason) {
         );
 
         if (tmdbEpisode && tmdbEpisode.id) {
-            media.currentEpisodeId = String(
-                tmdbEpisode.id
-            );
+            media.currentEpisodeId = String(tmdbEpisode.id);
         }
     }
 
     if (tmdbSeason && tmdbSeason.id) {
-        media.currentSeasonId = String(
-            tmdbSeason.id
-        );
+        media.currentSeasonId = String(tmdbSeason.id);
     }
 
     if (tmdbShow && tmdbShow.poster_path) {
-        media.posterUrl =
-            TMDB_POSTER + tmdbShow.poster_path;
+        media.posterUrl = TMDB_POSTER + tmdbShow.poster_path;
     }
 
     if (tmdbShow && tmdbShow.backdrop_path) {
-        media.backdropUrl =
-            TMDB_BACKDROP + tmdbShow.backdrop_path;
+        media.backdropUrl = TMDB_BACKDROP + tmdbShow.backdrop_path;
     }
 
-    var rating = toNumber(
-        tmdbShow && tmdbShow.vote_average
-    );
-
+    var rating = toNumber(tmdbShow && tmdbShow.vote_average);
     if (rating > 0) {
         media.rating = rating;
     }
 
-    var genres = toArray(
-        tmdbShow && tmdbShow.genres
-    ).map(function(genre) {
+    var genres = toArray(tmdbShow && tmdbShow.genres).map(function(genre) {
         return genre && genre.name;
     }).filter(Boolean);
 
@@ -503,22 +448,11 @@ function buildMediaItem(item, tmdbShow, tmdbSeason) {
         media.genres = genres;
     }
 
-    /*
-     * 保留 Trakt 官方 progress 信息，
-     * 但不参与“下一集”判定。
-     */
     var completed = toNumber(progress.completed);
     var aired = toNumber(progress.aired);
 
     if (aired > 0 && completed >= 0) {
-        var percent = Math.min(
-            100,
-            Math.max(
-                0,
-                completed / aired * 100
-            )
-        );
-
+        var percent = Math.min(100, Math.max(0, completed / aired * 100));
         media.description +=
             " · 进度 " +
             Math.round(percent * 10) / 10 +
@@ -532,7 +466,7 @@ function buildMediaItem(item, tmdbShow, tmdbSeason) {
     return media;
 }
 
-/* ==================== 并发 ==================== */
+/* ==================== 并发工具 ==================== */
 
 async function mapWithConcurrency(items, concurrency, worker) {
     var list = toArray(items);
@@ -555,13 +489,9 @@ async function mapWithConcurrency(items, concurrency, worker) {
                 while (cursor < list.length) {
                     var index = cursor++;
                     try {
-                        results[index] =
-                            await worker(list[index], index);
+                        results[index] = await worker(list[index], index);
                     } catch (error) {
-                        console.error(
-                            "处理 Trakt 条目失败:",
-                            error
-                        );
+                        console.error("处理 Trakt 条目失败:", error);
                         results[index] = null;
                     }
                 }
@@ -578,28 +508,19 @@ async function loadContinueWatching(params) {
     params = params || {};
 
     var accessToken = getAccessToken(params);
-    var user = getUser(params);
     var paging = getPaging(params);
 
     if (!accessToken) {
-        console.error(
-            "Trakt Continue Watching 需要 OAuth Access Token"
-        );
+        console.error("Trakt Continue Watching 需要 OAuth Access Token");
         return [];
     }
 
     try {
-        /*
-         * 关键：
-         * 这里不读取 History，也不计算最高观看集数。
-         * 列表本身直接来自 Trakt 官方 Up Next。
-         */
-        var officialItems =
-            await fetchOfficialContinueWatching(
-                accessToken,
-                paging.page,
-                paging.pageSize
-            );
+        var officialItems = await fetchOfficialContinueWatching(
+            accessToken,
+            paging.page,
+            paging.pageSize
+        );
 
         if (!officialItems.length) {
             return [];
@@ -617,56 +538,30 @@ async function loadContinueWatching(params) {
 
                 if (tmdbId) {
                     try {
-                        tmdbShow =
-                            await fetchTmdbShow(tmdbId);
+                        tmdbShow = await fetchTmdbShow(tmdbId);
                     } catch (error) {
-                        console.error(
-                            "TMDB 剧集信息读取失败:",
-                            error
-                        );
+                        console.error("TMDB 剧集信息读取失败:", error);
                     }
                 }
 
-                var episode =
-                    getEpisodeFromUpNext(item);
-                var season =
-                    getEpisodeSeason(episode);
+                var episode = getEpisodeFromUpNext(item);
+                var season = getEpisodeSeason(episode);
 
                 if (tmdbId && season > 0) {
                     try {
-                        tmdbSeason =
-                            await fetchTmdbSeason(
-                                tmdbId,
-                                season
-                            );
+                        tmdbSeason = await fetchTmdbSeason(tmdbId, season);
                     } catch (error) {
-                        console.error(
-                            "TMDB 季信息读取失败:",
-                            error
-                        );
+                        console.error("TMDB 季信息读取失败:", error);
                     }
                 }
 
-                return buildMediaItem(
-                    item,
-                    tmdbShow,
-                    tmdbSeason
-                );
+                return buildMediaItem(item, tmdbShow, tmdbSeason);
             }
         );
 
         return result.filter(Boolean);
     } catch (error) {
-        console.error(
-            "Trakt 官方 Continue Watching 加载失败:",
-            error
-        );
+        console.error("Trakt 官方 Continue Watching 加载失败:", error);
         return [];
     }
 }
-'''
-
-path = Path("/mnt/data/Trakt片单_官方ContinueWatching版.js")
-path.write_text(code, encoding="utf-8")
-print(f"已生成：{path}")
-print(f"行数：{len(code.splitlines())}")
